@@ -1,40 +1,96 @@
 import asyncio
-import websocket
+import websockets
+import subprocess
+import movement
+import video
 import cv2
-import numpy as np
-import ffmpeg
-import wheel
+import threading
+from obstacleAvoidance import ObstacleAvoidance
+from hcsr04 import Hcsr04
+from autoMoveWithObstacle import AutoMoveWithObstacle
+from circular import CircularMovement
 
 
 class FfmpegRtmp:
-    def __init__(self, url):
+    def __init__(self, url, v):
         self.url = url
-        self.stream = ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s='{}x{}'.format(640, 480))
-        self.stream = ffmpeg.output(self.stream, self.url, vcodec='libx264', pix_fmt='yuv420p', preset='ultrafast', r=30)
-        self.stream = ffmpeg.overwrite_output(self.stream)
-        self.stream = ffmpeg.compile(self.stream)
+        self.video = v
+        width = int(self.video.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self.video.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = int(self.video.cap.get(cv2.CAP_PROP_FPS))
+        command = ['ffmpeg',
+                   '-y', '-an',
+                   '-fflags', 'nobuffer',
+                   '-fflags', ' flush_packets',
+                   '-f', 'rawvideo',
+                   '-vcodec', 'rawvideo',
+                   '-r', '10',
+                   '-pix_fmt', 'bgr24',
+                   '-s', "{}x{}".format(width, height),
+                   '-i', '-',
+                   '-c:v', 'libx264',
+                   '-pix_fmt', 'yuv420p',
+                   '-vf', 'fps=fps=10',
+                   '-preset', 'ultrafast',
+                   '-tune', 'zerolatency',
+                   '-max_delay', '10',
+                   '-f', 'flv',
+                   '-profile:v', 'baseline',
+                   '-level', '1',
+                   '-flvflags', 'no_duration_filesize',
+                   url]
+        self.p = subprocess.Popen(command, shell=False, stdin=subprocess.PIPE)
 
     def send_frame(self, frame):
-        self.stream.run_async(pipe_stdin=True, pipe_stdout=False, pipe_stderr=False, input_data=frame.tostring())
+        self.p.stdin.write(frame.tostring())
+
+    def start(self):
+        while True:
+            frame = self.video.get_frame()
+            if frame is not None:
+                self.send_frame(frame)
+            else:
+                break
+
 
 class ControlServer:
-    def __init__(self, url):
-        self.url = url
-        self.ws = websocket.WebSocket()
-        self.ws.connect(url)
-        self.wheel = wheel.Wheel(1, 2, 3, 4)
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.move = movement.Movement()
+        self.hcsr = Hcsr04()
+        self.obstacle_avoidance = ObstacleAvoidance(self.move)
+        self.auto_move = AutoMoveWithObstacle(self.obstacle_avoidance)
+        self.circular = CircularMovement(self.obstacle_avoidance)
 
-    async def recv_and_exec(self):
-        async for msg in self.ws:
-            msg_list = msg.split(':')
-            wheel.set_speed(msg_list[:4])
-            reply = '成功'
-            await self.reply(reply)
 
-    async def reply(self, msg):
-        await self.ws.send(msg)
+    async def __recv_and_exec(self, websocket):
+        async for msg in websocket:
+                  msg_list = msg.split(':')
+                  msg_list = [float(i) for i in msg_list]
+                  reply = str(self.hcsr.get_distance())
+                  if len(msg_list) == 4:
+                      self.move.set_speed(msg_list[:4])
+                  elif msg_list[0] == 0:
+                      if msg_list[1] == 1:
+                          threading.Thread(target=self.obstacle_avoidance.start).start()
+                      else:
+                         self.obstacle_avoidance.stop()
+                  elif msg_list[0] == 1:
+                      if msg_list[1] == 1:
+                        threading.Thread(target = self.auto_move.start).start()
+                      else:
+                        self.auto_move.stop()
+                  elif msg_list[0] == 2:
+                      if msg_list[1] == 1:
+                        threading.Thread(target = self.circular.start, args=('bend',)).start()
+                      else:
+                        threading.Thread(target = self.circular.start, args=('axle',)).start()
+
+                  print(msg)
+                  await websocket.send(reply)
 
     async def start(self):
-        async with self.ws:
-            await self.recv_and_exec()
+        async with websockets.serve(self.__recv_and_exec, self.host, self.port):
+            await asyncio.Future()
 
